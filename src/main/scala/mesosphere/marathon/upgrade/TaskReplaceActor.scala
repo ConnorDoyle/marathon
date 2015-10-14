@@ -1,17 +1,19 @@
 package mesosphere.marathon.upgrade
 
-import akka.actor.{ Actor, ActorLogging }
+import akka.actor.{ Actor, ActorLogging, Cancellable }
 import akka.event.EventStream
 import mesosphere.marathon.TaskUpgradeCanceledException
 import mesosphere.marathon.core.launchqueue.LaunchQueue
 import mesosphere.marathon.event.{ HealthStatusChanged, MesosStatusUpdateEvent }
 import mesosphere.marathon.state.AppDefinition
 import mesosphere.marathon.tasks.TaskTracker
+import mesosphere.marathon.upgrade.TaskReplaceActor._
 import org.apache.mesos.Protos.TaskID
-import org.apache.mesos.{ Protos, SchedulerDriver }
+import org.apache.mesos.SchedulerDriver
 
 import scala.collection.mutable
 import scala.concurrent.Promise
+import scala.concurrent.duration._
 
 class TaskReplaceActor(
     driver: SchedulerDriver,
@@ -20,6 +22,7 @@ class TaskReplaceActor(
     eventBus: EventStream,
     app: AppDefinition,
     promise: Promise[Unit]) extends Actor with ActorLogging {
+  import context.dispatcher
 
   val tasksToKill = taskTracker.get(app.id)
   val appId = app.id
@@ -29,6 +32,8 @@ class TaskReplaceActor(
   var oldTaskIds = tasksToKill.map(_.getId)
   val toKill = oldTaskIds.to[mutable.Queue]
   var maxCapacity = (app.instances * (1 + app.upgradeStrategy.maximumOverCapacity)).toInt
+  var outstandingKills = Set.empty[String]
+  var periodicalRetryKills: Cancellable = _
 
   override def preStart(): Unit = {
     eventBus.subscribe(self, classOf[MesosStatusUpdateEvent])
@@ -45,12 +50,9 @@ class TaskReplaceActor(
       s"$minHealthy tasks running, maximum capacity $maxCapacity, killing $nrToKillImmediately tasks immediately")
 
     for (_ <- 0 until nrToKillImmediately) {
-      val taskId = Protos.TaskID.newBuilder
-        .setValue(toKill.dequeue())
-        .build()
-
-      driver.killTask(taskId)
+      killNextOldTask()
     }
+    scheduleRetryKills()
 
     reconcileNewTasks()
 
@@ -87,15 +89,20 @@ class TaskReplaceActor(
   }
 
   def commonBehavior: PartialFunction[Any, Unit] = {
-    case MesosStatusUpdateEvent(slaveId, taskId, ReplaceErrorState(_), _, `appId`, _, _, `version`, _, _) if !oldTaskIds(taskId) => // scalastyle:ignore line.size.limit
-      log.error(s"New task $taskId failed on slave $slaveId during app ${app.id.toString} restart")
+    case MesosStatusUpdateEvent(slaveId, taskId, TaskFailed(_), _, `appId`, _, _, `version`, _, _) if !oldTaskIds(taskId) => // scalastyle:ignore line.size.limit
+      log.error(s"New task $taskId failed on slave $slaveId during app $appId restart")
       healthy -= taskId
       taskQueue.add(app)
 
-    case MesosStatusUpdateEvent(slaveId, taskId, ReplaceErrorState(_), _, `appId`, _, _, _, _, _) if oldTaskIds(taskId) => // scalastyle:ignore line.size.limit
-      log.error(s"Old task $taskId failed on slave $slaveId during app ${app.id.toString} restart")
+    case MesosStatusUpdateEvent(slaveId, taskId, TaskFinished(_), _, `appId`, _, _, _, _, _) if oldTaskIds(taskId) => // scalastyle:ignore line.size.limit
       oldTaskIds -= taskId
+      outstandingKills -= taskId
       reconcileNewTasks()
+      checkFinished()
+
+    case RetryKills =>
+      retryKills()
+      scheduleRetryKills()
 
     case x: Any => log.debug(s"Received $x")
   }
@@ -113,23 +120,43 @@ class TaskReplaceActor(
 
   def handleNewHealthyTask(taskId: String): Unit = {
     healthy += taskId
-    killOldTask(taskId)
+    killNextOldTask(Some(taskId))
     checkFinished()
   }
 
-  def killOldTask(newTaskId: String): Unit = {
+  def killNextOldTask(maybeNewTaskId: Option[String] = None): Unit = {
     if (toKill.nonEmpty) {
-      val killing = toKill.dequeue()
-      log.info(s"Killing old task $killing because $newTaskId became reachable")
-      driver.killTask(buildTaskId(killing))
+      val nextOldTask = toKill.dequeue()
+
+      maybeNewTaskId match {
+        case Some(newTaskId: String) =>
+          log.info(s"Killing old task $nextOldTask because $newTaskId became reachable")
+        case _ =>
+          log.info(s"Killing old task $nextOldTask")
+      }
+
+      outstandingKills += nextOldTask
+      driver.killTask(buildTaskId(nextOldTask))
     }
   }
 
   def checkFinished(): Unit = {
-    if (healthy.size == app.instances) {
-      log.info(s"All tasks for $appId are healthy")
+    if (healthy.size == app.instances && oldTaskIds.isEmpty) {
+      log.info(s"App All new tasks for $appId are healthy and all old tasks have been killed")
+      periodicalRetryKills.cancel()
       promise.success(())
       context.stop(self)
+    }
+    else if (log.isDebugEnabled) {
+      log.debug(s"For app: [${app.id}] there are [${healthy.size}] healthy new instances and " +
+        s"[${oldTaskIds.size}] old instances.")
+    }
+  }
+
+  def retryKills(): Unit = {
+    outstandingKills.foreach { id =>
+      log.warning(s"Retrying kill of old task $id")
+      driver.killTask(buildTaskId(id))
     }
   }
 
@@ -137,12 +164,15 @@ class TaskReplaceActor(
     TaskID.newBuilder()
       .setValue(id)
       .build()
+
+  def scheduleRetryKills(): Unit =
+    periodicalRetryKills = context.system.scheduler.scheduleOnce(15.seconds, self, RetryKills)
 }
 
-private object ReplaceErrorState {
-  def unapply(state: String): Option[String] = state match {
-    case "TASK_ERROR" | "TASK_FAILED" | "TASK_KILLED" | "TASK_LOST" => Some(state)
-    case _ => None
-  }
+object TaskReplaceActor {
+  val TaskFinished = "^TASK_(ERROR|FAILED|FINISHED|LOST|KILLED)$".r
+  val TaskFailed = "^TASK_(ERROR|FAILED|LOST|KILLED)$".r
+
+  case object RetryKills
 }
 
