@@ -126,13 +126,15 @@ The core functionality flags can be also set by environment variable `MARATHON_O
     automatically by Marathon.
     _Note: This prefix will not be added to variables that are already prefixed,
     such as `MESOS_TASK_ID` and `MARATHON_APP_ID`
-
+* <span class="label label-default">v0.12.0</span> `--store_cache` (Optional. Default: true): Enable an in memory cache for the storage layer.
+    
 ## Tuning Flags for Offer Matching/Launching Tasks
 
 Mesos frequently sends resource offers to Marathon (and all other frameworks). Each offer will represent the
 available resources of a single node in the cluster. Before this <span class="label label-default">v0.8.2</span>,
 Marathon would only start a single task per
 resource offer, which led to slow task launching in smaller clusters.
+
 
 ### Marathon after 0.11.0 (including)
 
